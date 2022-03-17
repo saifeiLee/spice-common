@@ -41,6 +41,9 @@
 #include "macros.h"
 
 #include <spice/start-packed.h>
+#include <jxl/jpeg2jxl_v2_wrapper.h>
+#include "jxl/decode.h"
+
 typedef struct SPICE_ATTR_PACKED {
     uint32_t v;
 } uint32_unaligned_t;
@@ -438,6 +441,8 @@ static pixman_image_t *canvas_get_quic(CanvasBase *canvas, SpiceImage *image,
     return surface;
 }
 
+// #define DUMP_JPEG
+// #define DUMP_JXL
 
 //#define DUMP_JPEG
 static void
@@ -466,6 +471,78 @@ dump_jpeg(SPICE_GNUC_UNUSED SpiceChunks* data, SPICE_GNUC_UNUSED uint32_t data_s
 #endif
 }
 
+static void
+dump_jxl(SPICE_GNUC_UNUSED SpiceChunks* data, SPICE_GNUC_UNUSED uint32_t data_size)
+{
+#ifdef DUMP_JXL
+    printf("Dump jxl.... data: %p, data_size: %d\n", data, data_size);
+    static uint32_t jxl_id = 0;
+    char file_str[200];
+    uint32_t id = ++jxl_id;
+
+#ifdef WIN32
+    sprintf(file_str, "c:\\tmp\\spice_dump\\%u.jxl", id);
+#else
+    sprintf(file_str, "/tmp/spice_dump/%u.jxl", id);
+#endif
+
+    FILE *f = fopen(file_str, "wb");
+    printf("file_str: %s\n", file_str);
+    if (!f) {
+        printf("No file\n");
+        return;
+    }
+
+    for (uint32_t n = 0; n < data->num_chunks; ++n) {
+        fwrite(data->chunk[n].data, 1, data->chunk[n].len, f);
+    }
+    printf("Close  file.\n");
+    fclose(f);
+#endif
+}
+
+void decompress_jxl_to_jpeg(SpiceImage *image)
+{
+    JxlSignature signature = JxlSignatureCheck(image->u.jpeg.data->chunk[0].data, image->u.jpeg.data->chunk[0].len);
+    printf("signature: %d\n", signature);
+    if (signature == JXL_SIG_NOT_ENOUGH_BYTES || signature == JXL_SIG_INVALID) {
+        printf("不是jxl，不做处理.\n");
+    } else {
+        dump_jxl(image->u.jpeg.data, image->u.jpeg.data_size);
+        size_t decompressed_size;
+        printf("是jxl, 准备decode为jpeg. Chunk length: %d\n", image->u.jpeg.data->num_chunks);
+        uint8_t *jpeg_data = decodeJxlToJpegBytes_wrapper(image->u.jpeg.data->chunk[0].data, image->u.jpeg.data->chunk[0].len, &decompressed_size);
+        printf("decode jxl to jpeg success!!\n");
+        image->u.jpeg.data->chunk[0].len = decompressed_size;
+        image->u.jpeg.data_size = decompressed_size;
+
+        image->u.jpeg.data->chunk[0].data = jpeg_data;
+        // memcpy(image->u.jpeg.data->chunk[0].data, jpeg_data, decompressed_size);
+        // dump_jpeg(image->u.jpeg.data, image->u.jpeg.data_size);
+    }
+}
+void decompress_jxl_to_jpeg_alpha(SpiceImage *image)
+{
+    JxlSignature signature = JxlSignatureCheck(image->u.jpeg_alpha.data->chunk[0].data, image->u.jpeg_alpha.data->chunk[0].len);
+    printf("signature: %d\n", signature);
+    if (signature == JXL_SIG_NOT_ENOUGH_BYTES || signature == JXL_SIG_INVALID) {
+        printf("不是jxl，不做处理.\n");
+    } else {
+        // 有jpeg_size和data_size两个字段，注意
+        dump_jxl(image->u.jpeg_alpha.data, image->u.jpeg_alpha.jpeg_size);
+        size_t decompressed_size;
+        printf("是jxl, 准备decode为 jpeg_alpha. Chunk length: %d\n", image->u.jpeg_alpha.data->num_chunks);
+        uint8_t *jpeg_data = decodeJxlToJpegBytes_wrapper(image->u.jpeg_alpha.data->chunk[0].data, image->u.jpeg_alpha.data->chunk[0].len, &decompressed_size);
+        printf("decode jxl to jpeg_alpha success!!\n");
+        image->u.jpeg_alpha.data->chunk[0].len = decompressed_size;
+        image->u.jpeg_alpha.jpeg_size = decompressed_size;
+
+        // image->u.jpeg_alpha.data->chunk[0].data = jpeg_data;
+        // memcpy(image->u.jpeg.data->chunk[0].data, jpeg_data, decompressed_size);
+        // dump_jpeg(image->u.jpeg_alpha.data, image->u.jpeg_alpha.jpeg_size);
+    }
+}
+
 static pixman_image_t *canvas_get_jpeg(CanvasBase *canvas, SpiceImage *image)
 {
     pixman_image_t *surface = NULL;
@@ -475,8 +552,10 @@ static pixman_image_t *canvas_get_jpeg(CanvasBase *canvas, SpiceImage *image)
     uint8_t *dest;
 
     spice_return_val_if_fail(image->u.jpeg.data->num_chunks == 1, NULL);
+    decompress_jxl_to_jpeg(image);
     canvas->jpeg->ops->begin_decode(canvas->jpeg, image->u.jpeg.data->chunk[0].data, image->u.jpeg.data->chunk[0].len,
                                     &width, &height);
+    printf("begin decode 调用完成\n, width: %d, height: %d\n", width, height);
     spice_return_val_if_fail((uint32_t)width == image->descriptor.width, NULL);
     spice_return_val_if_fail((uint32_t)height == image->descriptor.height, NULL);
 
@@ -489,10 +568,10 @@ static pixman_image_t *canvas_get_jpeg(CanvasBase *canvas, SpiceImage *image)
 
     dest = (uint8_t *)pixman_image_get_data(surface);
     stride = pixman_image_get_stride(surface);
-
+    // printf("调用jepg decode\n");
+    // 这一行注释掉，client无画面
     canvas->jpeg->ops->decode(canvas->jpeg, dest, stride, SPICE_BITMAP_FMT_32BIT);
-
-    dump_jpeg(image->u.jpeg.data, image->u.jpeg.data_size);
+    // printf("jepg decode 调用完成\n");
     return surface;
 }
 
@@ -629,10 +708,48 @@ static pixman_image_t *canvas_get_jpeg_alpha(CanvasBase *canvas, SpiceImage *ima
     int lz_alpha_width, lz_alpha_height, n_comp_pixels, lz_alpha_top_down;
 
     spice_return_val_if_fail(image->u.jpeg_alpha.data->num_chunks == 1, NULL);
-    canvas->jpeg->ops->begin_decode(canvas->jpeg,
-                                    image->u.jpeg_alpha.data->chunk[0].data,
-                                    image->u.jpeg_alpha.jpeg_size,
-                                    &width, &height);
+    // decompress_jxl_to_jpeg_alpha(image);
+    size_t decompressed_jpeg_size;
+    uint8_t *jpeg_data;
+    JxlSignature signature = JxlSignatureCheck(image->u.jpeg_alpha.data->chunk[0].data, image->u.jpeg_alpha.data->chunk[0].len);
+    printf("signature: %d\n", signature);
+    if (signature == JXL_SIG_NOT_ENOUGH_BYTES || signature == JXL_SIG_INVALID) {
+        printf("不是jxl，不做处理.\n");
+        canvas->jpeg->ops->begin_decode(canvas->jpeg,
+                                image->u.jpeg_alpha.data->chunk[0].data,
+                                image->u.jpeg_alpha.jpeg_size,
+                                &width, &height);
+    } else {
+        // 有jpeg_size和data_size两个字段，注意
+        // dump_jxl(image->u.jpeg_alpha.data, image->u.jpeg_alpha.jpeg_size);
+        printf("是jxl, 准备decode为 jpeg_alpha. Chunk length: %d\n", image->u.jpeg_alpha.data->num_chunks);
+        jpeg_data = decodeJxlToJpegBytes_wrapper(image->u.jpeg_alpha.data->chunk[0].data, image->u.jpeg_alpha.data->chunk[0].len, &decompressed_jpeg_size);
+        printf("decode jxl to jpeg_alpha success!! decompressed_jpeg_size: %ld\n", decompressed_jpeg_size);
+        canvas->jpeg->ops->begin_decode(canvas->jpeg,
+                                jpeg_data,
+                                decompressed_jpeg_size,
+                                &width, &height);
+        // 处理data buffer, buffer由jpeg_data + jpeg_alpha_data两部分拼接而成
+        // char* jxl_data_buf = image->u.jpeg_alpha.data->chunk[0].data;
+        // char* alpha_buffer = (char*)jxl_data_buf + image->u.jpeg_alpha.jpeg_size;
+        // alpha_size = image->u.jpeg_alpha.data_size - image->u.jpeg_alpha.jpeg_size;
+        // 把alpha buffer 后移
+        // memmove((char *)jxl_data_buf + decompressed_jpeg_size, alpha_buffer, alpha_size);
+        // printf("把alpha buffer 后移\n");
+        // // 拷贝jxl-> jpeg解压缩的数据
+        // memcpy((char *)image->u.jpeg_alpha.data->chunk[0].data, jpeg_data, decompressed_jpeg_size);
+        // printf("拷贝jpeg\n");
+        // // image->u.jpeg_alpha.data->chunk[0].len = decompressed_jpeg_size;
+        // uint32_t diff_size = decompressed_jpeg_size - image->u.jpeg_alpha.jpeg_size;
+        // printf("diff_size: %ld\n", diff_size);
+        // image->u.jpeg_alpha.jpeg_size = decompressed_jpeg_size;
+        // image->u.jpeg_alpha.data_size += diff_size;
+        // printf("data_size:%ld\n", image->u.jpeg_alpha.data_size);
+        // image->u.jpeg_alpha.data->chunk[0].data = jpeg_data;
+        // memcpy(image->u.jpeg_alpha.data->chunk[0].data, jpeg_data, decompressed_size);
+        // dump_jpeg(image->u.jpeg_alpha.data, image->u.jpeg_alpha.jpeg_size);
+    }
+
     spice_return_val_if_fail((uint32_t)width == image->descriptor.width, NULL);
     spice_return_val_if_fail((uint32_t)height == image->descriptor.height, NULL);
 
@@ -672,7 +789,7 @@ static pixman_image_t *canvas_get_jpeg_alpha(CanvasBase *canvas, SpiceImage *ima
     }
     lz_decode(lz_data->lz, LZ_IMAGE_TYPE_XXXA, decomp_alpha_buf);
 
-    dump_jpeg(image->u.jpeg_alpha.data, image->u.jpeg_alpha.jpeg_size);
+    // dump_jpeg(image->u.jpeg_alpha.data, image->u.jpeg_alpha.jpeg_size);
     return surface;
 }
 
